@@ -62,7 +62,7 @@ def addrinfo(host: str, service: str, family: int) -> list[AddrInfo]:
     return addrs
 
 def get_ip(host: str, service: str, source: Optional[str], family: int) -> tuple[SockAddr, AddrInfo]:
-    addrs = addrinfo(host, service, family = family)
+    addrs = addrinfo(host, service, family)
 
     if source is None:
         for addr in addrs:
@@ -91,6 +91,8 @@ def get_ip(host: str, service: str, source: Optional[str], family: int) -> tuple
                         s.bind(saddr[4])
                         binds += 1
                         s.connect(addr[4])
+                        source_addr = s.getsockname()
+                        source_addr = (source_addr[0], 0, *source_addr[2:])
                 except OSError:
                     continue
                 break
@@ -107,7 +109,6 @@ def get_ip(host: str, service: str, source: Optional[str], family: int) -> tuple
 
             raise SystemExit("Cannot connect to any address of %s from any address of %s" %
                              (repr(host), repr(source)))
-        source_addr = saddr[4]
     return source_addr, addr
 
 def ttl_probe(from_addr: SockAddr, to: AddrInfo, ttl: int, wait_time: float, debug: bool = False) -> int:
@@ -192,7 +193,7 @@ def tcp_distance(
     if final == EHOSTUNREACH:
         raise SystemExit(f"Failed to connect to {host} {service} at TTL {high}:"
                          "{strerror(final)}\nThis means I'm unable to probe"
-                         "smaller TTLs. Aborting");
+                         "smaller TTLs. Aborting")
     while high != low:
         ttl = ceil(sqrt(low * (high-1)))
         err = ttl_probe(from_addr, to, ttl, wait_time, debug)
@@ -208,9 +209,9 @@ def tcp_distance(
                 print(f"Failed to connect to {host} {service} at TTL {ttl}: {strerror(err)}. Forging on in search of {strerror(final)}")
             low = ttl+1
     if final == 0:
-        print(f"Connected to {host} {service} at TTL {high}");
+        print(f"Connected to {host} {service} at TTL {high}")
     else:
-        print(f"Failed to connect to {host} {service} at TTL {high}: {strerror(final)}");
+        print(f"Failed to connect to {host} {service} at TTL {high}: {strerror(final)}")
     if not quiet and final != ECONNREFUSED:
         traceroute(traceroute_program, from_addr[0], to[4][0], high)
 

@@ -1,0 +1,34 @@
+---
+- name: Calculate next probe TTL
+  ansible.builtin.set_fact:
+    ttl: "{{ low | int | next_probe(high | int) }}"
+
+- name: "Do probe at TTL {{ ttl }}"
+  ansible.builtin.set_fact:
+    result: "{{ ttl | int | ttl_probe(ips, wait_time | float) }}"
+
+- name: Show probe result
+  ansible.builtin.debug:
+    msg: "{{ result.msg }}"
+
+
+- name: If probe is like final
+  when: result.errno == final.errno
+  ansible.builtin.set_fact:
+    high: "{{ ttl }}"
+
+- name: Recover from unexpected success
+  when: result.errno != final.errno and result.errno == 0
+  ansible.builtin.set_fact:
+    high: "{{ ttl }}"
+    final: "{{ result }}"
+
+- name: Probe is too short
+  when: result.errno != final.errno and result.errno != 0
+  ansible.builtin.set_fact:
+    low: "{{ ttl | int + 1 }}"
+
+- name: Further Intermediate probes
+  when: low != high
+  ansible.builtin.include_role:
+    name: ttl_probes

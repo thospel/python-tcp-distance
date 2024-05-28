@@ -1,0 +1,60 @@
+---
+- name: Find the hop distance at which a host connect succeeds or fails
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    # Name or IP
+    host: www.google.com
+    # Name or integer
+    service: www
+    # Name or IP
+    source: null
+    # Can be set to "4" or "6"
+    address_family: null
+    max_hops: 64
+    # Maximim probe time at one TTL in seconds (float)
+    wait_time: 5.0
+  roles:
+    - name: local_plugins
+
+  tasks:
+    - name: Determine IP address to probe
+      ansible.builtin.set_fact:
+        ips: "{{ address_family | get_ip(host, service, source) }}"
+        # high becomes a str again due to the {{ }}
+        high: "{{ max_hops | int }}"
+        low: "1"
+
+    # - debug: var=ips
+
+    - name: Show path
+      ansible.builtin.debug:
+        msg: "TCP Connect from {{ ips.source.0 }} to {{ ips.dest.0 }} port {{ ips.dest.1 }}"
+
+    - name: Establish the normal result
+      ansible.builtin.set_fact:
+        final: "{{ high | int | ttl_probe(ips, wait_time | float) }}"
+
+    # - debug: var=final
+
+    - name: Show normal result
+      ansible.builtin.debug:
+        msg: "{{ final.msg }}"
+
+    - name: Cannot proceed on EHOSTUNREACH
+      when: final.errno | is_unreachable
+      ansible.builtin.fail:
+        msg: "Failed to connect to {{ host }} {{ service }} at TTL {{ high }}: {{ final.error }}\nThis means I'm unable to probe smaller TTLs. Aborting"
+
+    - name: Intermediate probes
+      when: low != high
+      ansible.builtin.include_role:
+        name: ttl_probes
+
+    - name: Show TCP distance
+      vars:
+        msg_connect: "Connected to {{ host }} {{ service }} at TTL {{ high }}"
+        msg_fail: "Failed to connect to {{ host }} {{ service }} at TTL {{ high }}: {{ final.error }}"
+      ansible.builtin.debug:
+        msg: "{{ final.errno | ternary(msg_fail, msg_connect) }}"
