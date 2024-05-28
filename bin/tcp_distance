@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+from sys import stderr
+from math import sqrt, ceil
+from select import select
+from errno import ETIMEDOUT, EHOSTUNREACH, ECONNREFUSED
+from os import strerror
+from time import monotonic
+from subprocess import run, DEVNULL
+from argparse import ArgumentParser
+from socket import (
+    getaddrinfo, gaierror, inet_pton, socket, AddressFamily, SocketKind,
+    AF_INET, AF_INET6, IPPROTO_TCP, IPPROTO_IP, IPPROTO_IPV6, SOCK_DGRAM,
+    IP_TTL, IPV6_UNICAST_HOPS, SOL_SOCKET, SO_ERROR,
+    AI_ADDRCONFIG, AI_NUMERICSERV, AI_NUMERICHOST
+)
+from typing import Optional, Union
+
+VERSION = "1.000"
+
+DEFAULT_HOST = "www.google.com"
+DEFAULT_SERVICE = "www"
+DEFAULT_HOPS = 64
+DEFAULT_WAIT = 5.0
+DEFAULT_TRACEROUTE = "traceroute"
+
+MAX_TTL = 255
+
+SockAddr = Union[tuple[str, int], tuple[str, int, int, int]]
+AddrInfo = tuple[AddressFamily, SocketKind, int, str, SockAddr]
+
+def addrinfo(host: str, service: str, family: int) -> list[AddrInfo]:
+    flags = AI_ADDRCONFIG
+    try:
+        int(service)
+        flags |= AI_NUMERICSERV
+    except ValueError:
+        pass
+    if family == 0:
+        for f in AF_INET, AF_INET6:
+            try:
+                inet_pton(f, host)
+                flags |= AI_NUMERICHOST
+                break
+            except OSError:
+                pass
+    else:
+        try:
+            inet_pton(family, host)
+            flags |= AI_NUMERICHOST
+        except OSError:
+            pass
+
+    try:
+        addrs = getaddrinfo(host, service, family = family,
+                            proto = IPPROTO_TCP, flags = flags)
+    except gaierror as exc:
+        try:
+            addrs = getaddrinfo("0.0.0.0", service, proto = IPPROTO_TCP)
+        except gaierror:
+            raise SystemExit("Unknown TCP service %s" % repr(service)) from None
+        raise SystemExit("Cannot resolve %s: %s" % (repr(host), str(exc)))
+    return addrs
+
+def get_ip(host: str, service: str, source: Optional[str], family: int) -> tuple[SockAddr, AddrInfo]:
+    addrs = addrinfo(host, service, family = family)
+
+    if source is None:
+        for addr in addrs:
+            try:
+                with socket(addr[0], SOCK_DGRAM) as s:
+                    s.connect(addr[4])
+                    source_addr = s.getsockname()
+                    source_addr = (source_addr[0], 0, *source_addr[2:])
+            except OSError:
+                continue
+            break
+        else:
+            raise SystemExit("Cannot connect to any address of %s" % repr(host))
+    else:
+        saddrs = getaddrinfo(source, "0", family)
+        # Look for a compatibe source and destination
+        tried = 0
+        binds = 0
+        for addr in addrs:
+            for saddr in saddrs:
+                if addr[0] != saddr[0]:
+                    continue
+                tried += 1
+                try:
+                    with socket(addr[0], SOCK_DGRAM) as s:
+                        s.bind(saddr[4])
+                        binds += 1
+                        s.connect(addr[4])
+                except OSError:
+                    continue
+                break
+            else:
+                continue
+            break
+        else:
+            if not tried:
+                raise SystemExit("Address family of %s is incompatible with %s"
+                                 % (repr(host), repr(source)))
+            if not binds:
+                raise SystemExit("Cannot bind to any address of %s" %
+                                 repr(source))
+
+            raise SystemExit("Cannot connect to any address of %s from any address of %s" %
+                             (repr(host), repr(source)))
+        source_addr = saddr[4]
+    return source_addr, addr
+
+def ttl_probe(from_addr: SockAddr, to: AddrInfo, ttl: int, wait_time: float, debug: bool = False) -> int:
+    errno: int
+    with socket(*to[0:3]) as s:
+        s.bind(from_addr)
+        s.setblocking(False)
+        if to[0] == AF_INET:
+            s.setsockopt(IPPROTO_IP, IP_TTL, ttl)
+        elif to[0] == AF_INET6:
+            s.setsockopt(IPPROTO_IPV6, IPV6_UNICAST_HOPS, ttl)
+        else:
+            raise AssertionError(f"Impossible family {to[0]!r}")
+
+        start = monotonic()
+        try:
+            s.connect(to[4])
+            elapsed = monotonic() - start
+            errno = 0
+        except BlockingIOError:
+            now = start
+            end = now + wait_time
+            while True:
+                remaining = end - now
+                if remaining <= 0:
+                    elapsed = now - start
+                    errno = ETIMEDOUT
+                    break
+                try:
+                    _, write_sockets, _ = select([], [s], [], remaining)
+                except InterruptedError:
+                    pass
+                else:
+                    if write_sockets:
+                        elapsed = monotonic() - start
+                        errno = s.getsockopt(SOL_SOCKET, SO_ERROR)
+                        break
+                    # Othwerwise it must be a timeout
+                now = monotonic()
+        except OSError as exc:
+            elapsed = monotonic() - start
+            errno = exc.errno
+    if debug:
+        print("TTL %2d: %s after %.3f s" % (ttl, strerror(errno), elapsed), file = stderr)
+    return errno
+
+def traceroute(traceroute_program: str, source_ip: str, ip: str, ttl: int) -> None:
+    command = [traceroute_program, "-f", str(ttl), "-m", str(ttl), "-s", source_ip, ip]
+
+    result = run(command, stdin=DEVNULL)
+    if result.returncode != 0:
+        raise SystemExit("Unexpected exit code %d from %s" %
+                         (result.returncode, " ".join(command)))
+
+def tcp_distance(
+        ipv4: bool = False,
+        ipv6: bool = False,
+        max_hops: int = DEFAULT_HOPS,
+        source: Optional[str] = None,
+        wait_time: float = DEFAULT_WAIT,
+        traceroute_program: str = DEFAULT_TRACEROUTE,
+        quiet: bool = False,
+        debug: bool = False,
+        host: str = DEFAULT_HOST,
+        service: str = DEFAULT_SERVICE) -> None:
+
+    if max_hops < 1:
+        raise SystemExit("max_hops must be >= 1")
+    if max_hops > MAX_TTL:
+        raise SystemExit("max_hops must be < %d" % MAX_TTL)
+    if wait_time <= 0.0:
+        raise SystemExit("wait_time must be positive")
+
+    family = AF_INET if ipv4 else AF_INET6 if ipv6 else 0
+    from_addr, to = get_ip(host, service, source, family)
+    if not quiet:
+        print("TCP Connect from %s to %s port %s" % (from_addr[0], to[4][0], to[4][1]))
+
+    high = max_hops	# Lowest probe that had the expected result
+    low = 1		# Highest probe that did not have the expected result+1
+    final = ttl_probe(from_addr, to, high, wait_time, debug)
+    if final == EHOSTUNREACH:
+        raise SystemExit(f"Failed to connect to {host} {service} at TTL {high}:"
+                         "{strerror(final)}\nThis means I'm unable to probe"
+                         "smaller TTLs. Aborting");
+    while high != low:
+        ttl = ceil(sqrt(low * (high-1)))
+        err = ttl_probe(from_addr, to, ttl, wait_time, debug)
+        if err == final:
+            high = ttl
+        elif err == 0:
+            if not quiet:
+                print(f"Unexpected connect to {host} {service} at TTL {ttl} though we failed at TTL {high}. Recovering")
+            high  = ttl
+            final = err
+        else:
+            if not quiet and err != EHOSTUNREACH:
+                print(f"Failed to connect to {host} {service} at TTL {ttl}: {strerror(err)}. Forging on in search of {strerror(final)}")
+            low = ttl+1
+    if final == 0:
+        print(f"Connected to {host} {service} at TTL {high}");
+    else:
+        print(f"Failed to connect to {host} {service} at TTL {high}: {strerror(final)}");
+    if not quiet and final != ECONNREFUSED:
+        traceroute(traceroute_program, from_addr[0], to[4][0], high)
+
+if __name__=='__main__':
+    parser = ArgumentParser(
+        description = "Find the hop distance at which a host connect succeeds or fails",
+        epilog = "tcp_distance tries a connect with various TTLs to determine "
+        "at which hop count the normal result gets established. The main use of"
+        " this program is to determine how far away a host is or how far away a"
+        " blocking firewall sits. Combining the failure case with a normal"
+        " traceroute might then even get you the exact identity of the firewall"
+        " if anything is returned at that hop count."
+        " Unlike several standard TCP traceroute tools this program does not"
+        " require any special privileges"
+    )
+    family_group = parser.add_mutually_exclusive_group()
+    family_group.add_argument("-4", action="store_true", dest="ipv4",
+                              help = "Force ipv4")
+    family_group.add_argument("-6", action="store_true", dest="ipv6",
+                              help = "Force ipv6")
+    parser.add_argument("-m", "--max_hops", type=int, default=DEFAULT_HOPS,
+                        metavar = "HOPS",
+                        help = "Maximum hop distance that will be probed."
+                        " This is also determines the initial probe that gets "
+                        "done to determine the expected result of a connection."
+                        " Defaults to %d" % DEFAULT_HOPS)
+    parser.add_argument("-s", "--source", metavar="ADDR",
+                        help = "Chooses an alternative source address."
+                        " Note that you must select the address of one of the"
+                        " interfaces. By default, the address of the outgoing"
+                        " interface is used")
+    parser.add_argument("-w", "--wait_time", type=float, default=DEFAULT_WAIT,
+                        metavar="TIME",
+                        help = "How long to wait for the result of a connection"
+                        " attempt in seconds. Defaults to %f.1" % DEFAULT_WAIT)
+    parser.add_argument("-X", "--traceroute_program",
+                        default = DEFAULT_TRACEROUTE, metavar="PROGRAM",
+                        help = "If the connection fails a traceroute is run for"
+                        " the distance on which the connection fails. This"
+                        " option decides which  program gets run in that case."
+                        " Defaults to '%s'" % DEFAULT_TRACEROUTE)
+    parser.add_argument("-q", "--quiet", action="store_true",
+                        help="Be less chatty, just print the final result")
+    parser.add_argument("-d", "--debug", action="store_true",
+                        help="Give debugging output. Mainly tells you what"
+                        " probes get done and their result")
+    parser.add_argument("--version", action="version", version = "%(prog)s " + VERSION)
+    parser.add_argument("host", default=DEFAULT_HOST, nargs="?",
+                        help = "target host, defaults to '%s'" % DEFAULT_HOST)
+    parser.add_argument("service", default=DEFAULT_SERVICE, nargs="?",
+                        help = "Target port. Defaults to '%s' (80)" % DEFAULT_SERVICE)
+    args = parser.parse_args()
+    tcp_distance(**vars(args))
